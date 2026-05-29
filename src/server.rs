@@ -11,6 +11,10 @@ use crate::store::Store;
 
 type SharedStore = Arc<Mutex<Store>>;
 
+// TODO : change this to 60 seconds for actual code
+// TODO : currently this is 5 seconds for the unit tests
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn run(addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
 
@@ -23,7 +27,7 @@ pub async fn run(addr: &str) -> std::io::Result<()> {
 
     loop {
         tokio::select! {
-            result = listener.accept() => {
+            _result = listener.accept() => {
                 let (stream, client_addr) = listener.accept().await?;
                 println!("Client connected {}", client_addr);
 
@@ -87,29 +91,98 @@ pub async fn handle_client(
         line.clear();
 
         tokio::select! {
-            result = reader.read_line(&mut line) => {
-                let bytes_read = result?;
+            read_result = timeout(CLIENT_IDLE_TIMEOUT, reader.read_line(&mut line)) => {
+                match read_result {
+                    Ok(read_result) => {
+                        let bytes_read = read_result?;
 
-                if bytes_read == 0 {
-                    break;
-                }
-                // The lock is dropped immediately after accessing the store
-                // This is good practice because you don't want to hold the
-                // lock for too long.
-                let response = match Command::parse(&line) {
-                    Ok(command) => {
-                        let mut store = store.lock().await;
-                        store.execute(command)
+                        if bytes_read == 0 {
+                            break;
+                        }
+
+                        let response = match Command::parse(&line) {
+                            Ok(command) => {
+                                let mut store = store.lock().await;
+                                store.execute(command)
+                            }
+                            Err(err) => err.response().to_string(),
+                        };
+
+                        writer.write_all(response.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
                     }
-                    Err(err) => err.response().to_string(),
-                };
 
-                writer.write_all(response.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
+                    Err(_) => {
+                        writer.write_all(b"SERVER idle timeout\n").await?;
+                        break;
+                    }
+                }
             }
 
-            result = shutdown_rx.recv() => {
-                match result {
+            shutdown_result = shutdown_rx.recv() => {
+                match shutdown_result {
+                    Ok(()) => {
+                        writer.write_all(b"SERVER shutting down\n").await?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        writer.write_all(b"SERVER shutting down\n").await?;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        writer.write_all(b"SERVER shutting down\n").await?;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn handle_client_with_timeout(
+    stream: TcpStream,
+    store: SharedStore,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    idle_timeout: Duration,
+) -> std::io::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+
+        tokio::select! {
+            read_result = timeout(idle_timeout, reader.read_line(&mut line)) => {
+                match read_result {
+                    Ok(read_result) => {
+                        let bytes_read = read_result?;
+
+                        if bytes_read == 0 {
+                            break;
+                        }
+
+                        let response = match Command::parse(&line) {
+                            Ok(command) => {
+                                let mut store = store.lock().await;
+                                store.execute(command)
+                            }
+                            Err(err) => err.response().to_string(),
+                        };
+
+                        writer.write_all(response.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                    }
+
+                    Err(_) => {
+                        writer.write_all(b"SERVER idle timeout\n").await?;
+                        break;
+                    }
+                }
+            }
+
+            shutdown_result = shutdown_rx.recv() => {
+                match shutdown_result {
                     Ok(()) => {
                         writer.write_all(b"SERVER shutting down\n").await?;
                     }
@@ -171,9 +244,36 @@ mod tests {
         (BufReader::new(reader), writer, server_task, _shutdown_tx)
     }
 
+    async fn start_test_client_with_timeout(
+        idle_timeout: Duration,
+    ) -> (
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+        tokio::task::JoinHandle<()>,
+        broadcast::Sender<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let store = Arc::new(Mutex::new(Store::new()));
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client_with_timeout(stream, store, shutdown_rx, idle_timeout)
+                .await
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (reader, writer) = stream.into_split();
+
+        (BufReader::new(reader), writer, server_task, shutdown_tx)
+    }
+
     #[tokio::test]
     async fn handles_ping_command() {
-        let (mut reader, mut writer, server_task, shutdown_tx) = start_test_client().await;
+        let (mut reader, mut writer, server_task, _shutdown_tx) = start_test_client().await;
 
         let response = send_command(&mut reader, &mut writer, "PING").await;
 
@@ -185,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_set_and_get_commands() {
-        let (mut reader, mut writer, server_task, shutdown_tx) = start_test_client().await;
+        let (mut reader, mut writer, server_task, _shutdown_tx) = start_test_client().await;
 
         let response = send_command(&mut reader, &mut writer, "SET name alice").await;
         assert_eq!(response, "OK");
@@ -199,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_unknown_command() {
-        let (mut reader, mut writer, server_task, shutdown_tx) = start_test_client().await;
+        let (mut reader, mut writer, server_task, _shutdown_tx) = start_test_client().await;
 
         let response = send_command(&mut reader, &mut writer, "BANANA").await;
 
@@ -211,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_keys_and_flushall_commands() {
-        let (mut reader, mut writer, server_task, shutdown_tx) = start_test_client().await;
+        let (mut reader, mut writer, server_task, _shutdown_tx) = start_test_client().await;
 
         let response = send_command(&mut reader, &mut writer, "SET name alice").await;
         assert_eq!(response, "OK");
@@ -269,6 +369,19 @@ mod tests {
 
         drop(writer1);
         drop(writer2);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnects_idle_client_after_timeout() {
+        let (mut reader, _writer, server_task, _shutdown_tx) =
+            start_test_client_with_timeout(Duration::from_millis(50)).await;
+
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        assert_eq!(response.trim(), "SERVER idle timeout");
 
         server_task.await.unwrap();
     }
