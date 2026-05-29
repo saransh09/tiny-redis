@@ -3,6 +3,7 @@ pub enum ParseError {
     EmptyCommand,
     WrongNumberOfArguments,
     UnknownCommand,
+    InvalidInteger,
 }
 
 impl ParseError {
@@ -11,6 +12,7 @@ impl ParseError {
             ParseError::EmptyCommand => "ERR empty command",
             ParseError::WrongNumberOfArguments => "ERR wrong number of arguments",
             ParseError::UnknownCommand => "ERR unknown command",
+            ParseError::InvalidInteger => "ERR invalid integer",
         }
     }
 }

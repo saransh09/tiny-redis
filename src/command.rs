@@ -3,12 +3,29 @@ use crate::errors::ParseError;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Ping,
-    Set { key: String, value: String },
-    Get { key: String },
-    Del { key: String },
-    Exists { key: String },
+    Set {
+        key: String,
+        value: String,
+    },
+    Get {
+        key: String,
+    },
+    Del {
+        key: String,
+    },
+    Exists {
+        key: String,
+    },
     Keys,
     FlushAll,
+    SetEx {
+        key: String,
+        seconds: u64,
+        value: String,
+    },
+    Ttl {
+        key: String,
+    },
 }
 
 impl Command {
@@ -21,22 +38,45 @@ impl Command {
 
         match parts[0].to_uppercase().as_str() {
             "PING" if parts.len() == 1 => Ok(Command::Ping),
+
             "SET" if parts.len() == 3 => Ok(Command::Set {
                 key: parts[1].to_string(),
                 value: parts[2].to_string(),
             }),
+
             "GET" if parts.len() == 2 => Ok(Command::Get {
                 key: parts[1].to_string(),
             }),
+
             "DEL" if parts.len() == 2 => Ok(Command::Del {
                 key: parts[1].to_string(),
             }),
+
             "EXISTS" if parts.len() == 2 => Ok(Command::Exists {
                 key: parts[1].to_string(),
             }),
+
             "KEYS" if parts.len() == 1 => Ok(Command::Keys),
+
             "FLUSHALL" if parts.len() == 1 => Ok(Command::FlushAll),
-            "PING" | "SET" | "GET" | "DEL" | "EXISTS" | "KEYS" | "FLUSHALL" => {
+
+            "SETEX" if parts.len() == 4 => {
+                let seconds = parts[2]
+                    .parse::<u64>()
+                    .map_err(|_| ParseError::InvalidInteger)?;
+
+                Ok(Command::SetEx {
+                    key: parts[1].to_string(),
+                    seconds,
+                    value: parts[3].to_string(),
+                })
+            }
+
+            "TTL" if parts.len() == 2 => Ok(Command::Ttl {
+                key: parts[1].to_string(),
+            }),
+
+            "PING" | "SET" | "GET" | "DEL" | "EXISTS" | "KEYS" | "FLUSHALL" | "SETEX" | "TTL" => {
                 Err(ParseError::WrongNumberOfArguments)
             }
 
@@ -114,6 +154,36 @@ mod tests {
         assert_eq!(
             Command::parse("FLUSHALL extra"),
             Err(ParseError::WrongNumberOfArguments)
+        );
+    }
+
+    #[test]
+    fn parses_setex() {
+        assert_eq!(
+            Command::parse("SETEX session 10 abc"),
+            Ok(Command::SetEx {
+                key: "session".to_string(),
+                seconds: 10,
+                value: "abc".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_ttl() {
+        assert_eq!(
+            Command::parse("TTL session"),
+            Ok(Command::Ttl {
+                key: "session".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_setex_with_invalid_integer() {
+        assert_eq!(
+            Command::parse("SETEX session banana abc"),
+            Err(ParseError::InvalidInteger)
         );
     }
 }

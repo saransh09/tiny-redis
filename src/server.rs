@@ -21,7 +21,15 @@ pub async fn run(addr: &str) -> std::io::Result<()> {
     println!("Listening on {}", addr);
 
     let store = Arc::new(Mutex::new(Store::new()));
+
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    let cleanup_store = Arc::clone(&store);
+    let cleanup_shutdown_rx = shutdown_tx.subscribe();
+
+    let cleanup_task = tokio::spawn(async move {
+        run_cleanup_task(cleanup_store, cleanup_shutdown_rx).await;
+    });
 
     let mut client_tasks = Vec::new();
 
@@ -62,6 +70,10 @@ pub async fn run(addr: &str) -> std::io::Result<()> {
     let _ = shutdown_tx.send(());
     println!("Waiting for client tasks to finish");
 
+    if let Err(err) = cleanup_task.await {
+        eprintln!("cleanup task failed to join: {}", err);
+    }
+
     for task in client_tasks {
         match timeout(Duration::from_secs(5), task).await {
             Ok(join_result) => {
@@ -76,6 +88,22 @@ pub async fn run(addr: &str) -> std::io::Result<()> {
     }
     println!("Server shutting down");
     Ok(())
+}
+
+async fn run_cleanup_task(store: SharedStore, mut shutdown_rx: broadcast::Receiver<()>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let mut store = store.lock().await;
+                store.cleanup_expired();
+            }
+
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+        }
+    }
 }
 
 pub async fn handle_client(
@@ -383,6 +411,23 @@ mod tests {
 
         assert_eq!(response.trim(), "SERVER idle timeout");
 
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handles_setex_and_ttl_commands() {
+        let (mut reader, mut writer, server_task, _shutdown_tx) = start_test_client().await;
+
+        let response = send_command(&mut reader, &mut writer, "SETEX session 10 abc").await;
+        assert_eq!(response, "OK");
+
+        let response = send_command(&mut reader, &mut writer, "GET session").await;
+        assert_eq!(response, "abc");
+
+        let response = send_command(&mut reader, &mut writer, "TTL session").await;
+        assert_ne!(response, "-2");
+
+        drop(writer);
         server_task.await.unwrap();
     }
 }
