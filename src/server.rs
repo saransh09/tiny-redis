@@ -1,8 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
+use tokio::time::timeout;
 
 use crate::command::Command;
 use crate::store::Store;
@@ -15,22 +17,68 @@ pub async fn run(addr: &str) -> std::io::Result<()> {
     println!("Listening on {}", addr);
 
     let store = Arc::new(Mutex::new(Store::new()));
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    let mut client_tasks = Vec::new();
 
     loop {
-        let (stream, client_addr) = listener.accept().await?;
-        println!("Client connected {}", client_addr);
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, client_addr) = listener.accept().await?;
+                println!("Client connected {}", client_addr);
 
-        let store = Arc::clone(&store);
+                let store = Arc::clone(&store);
+                let shutdown_rx = shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, store).await {
-                eprintln!("client error: {}", err);
+                let task = tokio::spawn(async move {
+                    if let Err(err) = handle_client(stream, store, shutdown_rx).await {
+                        eprintln!("client error: {}", err);
+                    }
+                });
+
+                client_tasks.push(task);
             }
-        });
+
+            result = tokio::signal::ctrl_c() => {
+                match result {
+                    Ok(()) => {
+                        println!("Shutdown signal received");
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to listen for shutdown signal: {}", err);
+                    }
+                }
+                break;
+            }
+        }
     }
+
+    println!("Notifying clients about shutdown");
+
+    let _ = shutdown_tx.send(());
+    println!("Waiting for client tasks to finish");
+
+    for task in client_tasks {
+        match timeout(Duration::from_secs(5), task).await {
+            Ok(join_result) => {
+                if let Err(err) = join_result {
+                    eprintln!("client task failed to join: {}", err);
+                }
+            }
+            Err(_) => {
+                eprintln!("client task did not finish before timeout");
+            }
+        }
+    }
+    println!("Server shutting down");
+    Ok(())
 }
 
-pub async fn handle_client(stream: TcpStream, store: SharedStore) -> std::io::Result<()> {
+pub async fn handle_client(
+    stream: TcpStream,
+    store: SharedStore,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -38,25 +86,43 @@ pub async fn handle_client(stream: TcpStream, store: SharedStore) -> std::io::Re
     loop {
         line.clear();
 
-        let bytes_read = reader.read_line(&mut line).await?;
+        tokio::select! {
+            result = reader.read_line(&mut line) => {
+                let bytes_read = result?;
 
-        if bytes_read == 0 {
-            break;
-        }
+                if bytes_read == 0 {
+                    break;
+                }
+                // The lock is dropped immediately after accessing the store
+                // This is good practice because you don't want to hold the
+                // lock for too long.
+                let response = match Command::parse(&line) {
+                    Ok(command) => {
+                        let mut store = store.lock().await;
+                        store.execute(command)
+                    }
+                    Err(err) => err.response().to_string(),
+                };
 
-        // The lock is dropped immediately after accessing the store
-        // This is good practice because you don't want to hold the
-        // lock for too long.
-        let response = match Command::parse(&line) {
-            Ok(command) => {
-                let mut store = store.lock().await;
-                store.execute(command)
+                writer.write_all(response.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
             }
-            Err(err) => err.response().to_string(),
-        };
 
-        writer.write_all(response.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
+            result = shutdown_rx.recv() => {
+                match result {
+                    Ok(()) => {
+                        writer.write_all(b"SERVER shutting down\n").await?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        writer.write_all(b"SERVER shutting down\n").await?;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        writer.write_all(b"SERVER shutting down\n").await?;
+                    }
+                }
+                break;
+            }
+        }
     }
 
     Ok(())
@@ -86,26 +152,28 @@ mod tests {
         BufReader<tokio::net::tcp::OwnedReadHalf>,
         tokio::net::tcp::OwnedWriteHalf,
         tokio::task::JoinHandle<()>,
+        broadcast::Sender<()>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let store = Arc::new(Mutex::new(Store::new()));
+        let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_client(stream, store).await.unwrap();
+            handle_client(stream, store, shutdown_rx).await.unwrap();
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
         let (reader, writer) = stream.into_split();
 
-        (BufReader::new(reader), writer, server_task)
+        (BufReader::new(reader), writer, server_task, _shutdown_tx)
     }
 
     #[tokio::test]
     async fn handles_ping_command() {
-        let (mut reader, mut writer, server_task) = start_test_client().await;
+        let (mut reader, mut writer, server_task, shutdown_tx) = start_test_client().await;
 
         let response = send_command(&mut reader, &mut writer, "PING").await;
 
@@ -117,7 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_set_and_get_commands() {
-        let (mut reader, mut writer, server_task) = start_test_client().await;
+        let (mut reader, mut writer, server_task, shutdown_tx) = start_test_client().await;
 
         let response = send_command(&mut reader, &mut writer, "SET name alice").await;
         assert_eq!(response, "OK");
@@ -131,7 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_unknown_command() {
-        let (mut reader, mut writer, server_task) = start_test_client().await;
+        let (mut reader, mut writer, server_task, shutdown_tx) = start_test_client().await;
 
         let response = send_command(&mut reader, &mut writer, "BANANA").await;
 
@@ -143,7 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_keys_and_flushall_commands() {
-        let (mut reader, mut writer, server_task) = start_test_client().await;
+        let (mut reader, mut writer, server_task, shutdown_tx) = start_test_client().await;
 
         let response = send_command(&mut reader, &mut writer, "SET name alice").await;
         assert_eq!(response, "OK");
@@ -169,13 +237,17 @@ mod tests {
         let store = Arc::new(Mutex::new(Store::new()));
         let server_store = Arc::clone(&store);
 
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let server_shutdown_tx = shutdown_tx.clone();
+
         let server_task = tokio::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let store = Arc::clone(&server_store);
+                let shutdown_rx = server_shutdown_tx.subscribe();
 
                 tokio::spawn(async move {
-                    handle_client(stream, store).await.unwrap();
+                    handle_client(stream, store, shutdown_rx).await.unwrap();
                 });
             }
         });
