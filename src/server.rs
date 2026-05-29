@@ -52,7 +52,7 @@ pub async fn handle_client(stream: TcpStream, store: SharedStore) -> std::io::Re
                 let mut store = store.lock().await;
                 store.execute(command)
             }
-            Err(err) => err,
+            Err(err) => err.response().to_string(),
         };
 
         writer.write_all(response.as_bytes()).await?;
@@ -66,10 +66,27 @@ pub async fn handle_client(stream: TcpStream, store: SharedStore) -> std::io::Re
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
-    #[tokio::test]
-    async fn handles_ping_command() {
+    async fn send_command(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        command: &str,
+    ) -> String {
+        writer.write_all(command.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        response.trim().to_string()
+    }
+
+    async fn start_test_client() -> (
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -81,15 +98,18 @@ mod tests {
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
+        let (reader, writer) = stream.into_split();
 
-        writer.write_all(b"PING\n").await.unwrap();
+        (BufReader::new(reader), writer, server_task)
+    }
 
-        let mut response = String::new();
-        reader.read_line(&mut response).await.unwrap();
+    #[tokio::test]
+    async fn handles_ping_command() {
+        let (mut reader, mut writer, server_task) = start_test_client().await;
 
-        assert_eq!(response.trim(), "PONG");
+        let response = send_command(&mut reader, &mut writer, "PING").await;
+
+        assert_eq!(response, "PONG");
 
         drop(writer);
         server_task.await.unwrap();
@@ -97,32 +117,45 @@ mod tests {
 
     #[tokio::test]
     async fn handles_set_and_get_commands() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (mut reader, mut writer, server_task) = start_test_client().await;
 
-        let store = Arc::new(Mutex::new(Store::new()));
+        let response = send_command(&mut reader, &mut writer, "SET name alice").await;
+        assert_eq!(response, "OK");
 
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_client(stream, store).await.unwrap();
-        });
+        let response = send_command(&mut reader, &mut writer, "GET name").await;
+        assert_eq!(response, "alice");
 
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
+        drop(writer);
+        server_task.await.unwrap();
+    }
 
-        writer.write_all(b"SET name alice\n").await.unwrap();
+    #[tokio::test]
+    async fn handles_unknown_command() {
+        let (mut reader, mut writer, server_task) = start_test_client().await;
 
-        let mut response = String::new();
-        reader.read_line(&mut response).await.unwrap();
-        assert_eq!(response.trim(), "OK");
+        let response = send_command(&mut reader, &mut writer, "BANANA").await;
 
-        response.clear();
+        assert_eq!(response, "ERR unknown command");
 
-        writer.write_all(b"GET name\n").await.unwrap();
+        drop(writer);
+        server_task.await.unwrap();
+    }
 
-        reader.read_line(&mut response).await.unwrap();
-        assert_eq!(response.trim(), "alice");
+    #[tokio::test]
+    async fn handles_keys_and_flushall_commands() {
+        let (mut reader, mut writer, server_task) = start_test_client().await;
+
+        let response = send_command(&mut reader, &mut writer, "SET name alice").await;
+        assert_eq!(response, "OK");
+
+        let response = send_command(&mut reader, &mut writer, "KEYS").await;
+        assert_eq!(response, "name");
+
+        let response = send_command(&mut reader, &mut writer, "FLUSHALL").await;
+        assert_eq!(response, "OK");
+
+        let response = send_command(&mut reader, &mut writer, "GET name").await;
+        assert_eq!(response, "(nil)");
 
         drop(writer);
         server_task.await.unwrap();
@@ -134,7 +167,6 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let store = Arc::new(Mutex::new(Store::new()));
-
         let server_store = Arc::clone(&store);
 
         let server_task = tokio::spawn(async move {
@@ -157,17 +189,11 @@ mod tests {
         let (reader2, mut writer2) = client2.into_split();
         let mut reader2 = BufReader::new(reader2);
 
-        let mut response = String::new();
+        let response = send_command(&mut reader1, &mut writer1, "SET shared hello").await;
+        assert_eq!(response, "OK");
 
-        writer1.write_all(b"SET shared hello\n").await.unwrap();
-        reader1.read_line(&mut response).await.unwrap();
-        assert_eq!(response.trim(), "OK");
-
-        response.clear();
-
-        writer2.write_all(b"GET shared\n").await.unwrap();
-        reader2.read_line(&mut response).await.unwrap();
-        assert_eq!(response.trim(), "hello");
+        let response = send_command(&mut reader2, &mut writer2, "GET shared").await;
+        assert_eq!(response, "hello");
 
         drop(writer1);
         drop(writer2);

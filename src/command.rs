@@ -1,3 +1,5 @@
+use crate::errors::ParseError;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Ping,
@@ -5,14 +7,16 @@ pub enum Command {
     Get { key: String },
     Del { key: String },
     Exists { key: String },
+    Keys,
+    FlushAll,
 }
 
 impl Command {
-    pub fn parse(input: &str) -> Result<Self, String> {
+    pub fn parse(input: &str) -> Result<Command, ParseError> {
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
 
         if parts.is_empty() {
-            return Err("ERR empty commmand".to_string());
+            return Err(ParseError::EmptyCommand);
         }
 
         match parts[0].to_uppercase().as_str() {
@@ -30,12 +34,13 @@ impl Command {
             "EXISTS" if parts.len() == 2 => Ok(Command::Exists {
                 key: parts[1].to_string(),
             }),
-
-            "PING" | "SET" | "GET" | "DEL" | "EXISTS" => {
-                Err("ERR wrong number of arguments".to_string())
+            "KEYS" if parts.len() == 1 => Ok(Command::Keys),
+            "FLUSHALL" if parts.len() == 1 => Ok(Command::FlushAll),
+            "PING" | "SET" | "GET" | "DEL" | "EXISTS" | "KEYS" | "FLUSHALL" => {
+                Err(ParseError::WrongNumberOfArguments)
             }
 
-            _ => Err("ERR unknown command".to_string()),
+            _ => Err(ParseError::UnknownCommand),
         }
     }
 }
@@ -74,7 +79,7 @@ mod tests {
     fn rejects_unknown_command() {
         assert_eq!(
             Command::parse("BANANA name"),
-            Err("ERR unknown command".to_string())
+            Err(ParseError::UnknownCommand)
         );
     }
 
@@ -82,7 +87,33 @@ mod tests {
     fn rejects_wrong_argument_count() {
         assert_eq!(
             Command::parse("GET"),
-            Err("ERR wrong number of arguments".to_string())
+            Err(ParseError::WrongNumberOfArguments)
+        );
+    }
+
+    #[test]
+    fn parses_keys() {
+        assert_eq!(Command::parse("KEYS"), Ok(Command::Keys));
+    }
+
+    #[test]
+    fn parses_flushall() {
+        assert_eq!(Command::parse("FLUSHALL"), Ok(Command::FlushAll));
+    }
+
+    #[test]
+    fn rejects_keys_with_arguments() {
+        assert_eq!(
+            Command::parse("KEYS extra"),
+            Err(ParseError::WrongNumberOfArguments)
+        );
+    }
+
+    #[test]
+    fn rejects_flushall_with_arguments() {
+        assert_eq!(
+            Command::parse("FLUSHALL extra"),
+            Err(ParseError::WrongNumberOfArguments)
         );
     }
 }

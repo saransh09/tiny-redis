@@ -44,6 +44,19 @@ impl Store {
                     "0".to_string()
                 }
             }
+
+            Command::Keys => {
+                if self.data.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    self.data.keys().cloned().collect::<Vec<_>>().join(" ")
+                }
+            }
+
+            Command::FlushAll => {
+                self.data.clear();
+                "OK".to_string()
+            }
         }
     }
 }
@@ -118,5 +131,70 @@ mod tests {
         });
 
         assert_eq!(response, "1");
+    }
+
+    #[test]
+    fn keys_returns_existing_keys() {
+        let mut store = Store::new();
+
+        store.execute(Command::Set {
+            key: "name".to_string(),
+            value: "alice".to_string(),
+        });
+
+        let response = store.execute(Command::Keys);
+
+        assert_eq!(response, "name");
+    }
+
+    #[test]
+    fn keys_returns_multiple_existing_keys() {
+        let mut store = Store::new();
+
+        store.execute(Command::Set {
+            key: "a".to_string(),
+            value: "1".to_string(),
+        });
+
+        store.execute(Command::Set {
+            key: "b".to_string(),
+            value: "2".to_string(),
+        });
+
+        let response = store.execute(Command::Keys);
+
+        let mut keys: Vec<&str> = response.split_whitespace().collect();
+        keys.sort();
+
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn keys_returns_empty_when_store_is_empty() {
+        let mut store = Store::new();
+
+        let response = store.execute(Command::Keys);
+
+        assert_eq!(response, "(empty)");
+    }
+
+    #[test]
+    fn flushall_clears_all_keys() {
+        let mut store = Store::new();
+
+        store.execute(Command::Set {
+            key: "name".to_string(),
+            value: "alice".to_string(),
+        });
+
+        let response = store.execute(Command::FlushAll);
+
+        assert_eq!(response, "OK");
+
+        let get_response = store.execute(Command::Get {
+            key: "name".to_string(),
+        });
+
+        assert_eq!(get_response, "(nil)");
     }
 }
